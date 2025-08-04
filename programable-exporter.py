@@ -8,6 +8,7 @@ import stopit2
 import time
 import subprocess
 import shutil
+import threading
 
 # Load config
 config = configparser.ConfigParser()
@@ -43,6 +44,26 @@ probe_last_start = prometheus_client.Gauge(
 )
 
 class Probes():
+    def probe_slow(self, _):
+        """
+        Test probe to ensure we handle timeouting probes.
+        """
+        logger = logging.getLogger("probe_slow")
+
+        logger.debug("Starting slow probe")
+        time.sleep(20)
+        logger.debug("Timeout did not happened - this should not happen!")
+
+    def probe_exception(self, _):
+        """
+        Test probe to ensure we handle probes that throw traceback.
+        """
+        logger = logging.getLogger("probe_exception")
+
+        logger.debug("Starting buggy probe")
+        raise Exception("Just to test we handle exceptions")
+        logger.debug("Exception did not happened - this should not happen!")
+
     def probe_quay(self, image):
         """
         Test if we can pull from quay.io
@@ -85,6 +106,28 @@ class Probes():
         logger.debug(f"Cloned: {completed}")
 
 
+def iteration(probe):
+    logger = logging.getLogger("iteration")
+
+    probe_last_start.labels(name=probe["name"], args=probe["args"]).set_to_current_time()
+    before = time.perf_counter()
+    try:
+        with stopit2.ThreadingTimeout(probe["timeout"]) as timeout_mgr:
+            probe["func"](probe["args"])
+        if not timeout_mgr:
+            raise Exception("Probe {probe['name']} did not finished before timeout {probe['timeout']}")
+    except Exception as e:
+        probe_success.labels(name=probe["name"], args=probe["args"]).set(1)
+        logger.exception(f"Probe {probe['name']} failed with {e}")
+    else:
+        probe_success.labels(name=probe["name"], args=probe["args"]).set(0)
+        logger.info(f"Probe {probe['name']} passed")
+    after = time.perf_counter()
+    duration = after - before
+    probe_duration.labels(name=probe["name"], args=probe["args"]).set(duration)
+    logger.info(f"Probe {probe['name']} took {duration} seconds to run")
+
+
 if __name__ == "__main__":
     logger.info("Starting metrics endpoint server")
     prometheus_client.start_http_server(int(config["config"]["port"]))
@@ -108,26 +151,16 @@ if __name__ == "__main__":
     logger.info("Starting probing loop")
     while True:
         start = time.perf_counter()
+        threads = []
         for probe in probes_list:
-            probe_last_start.labels(name=probe["name"], args=probe["args"]).set_to_current_time()
-            before = time.perf_counter()
-            try:
-                with stopit2.ThreadingTimeout(probe["timeout"]) as timeout_mgr:
-                    probe["func"](probe["args"])
-                if not timeout_mgr:
-                    raise Exception("Probe {probe['name']} did not finished before timeout {probe['timeout']}")
-            except Exception as e:
-                probe_success.labels(name=probe["name"], args=probe["args"]).set(1)
-                logger.exception(f"Probe {probe['name']} failed with {e}")
-            else:
-                probe_success.labels(name=probe["name"], args=probe["args"]).set(0)
-                logger.info(f"Probe {probe['name']} passed")
-            after = time.perf_counter()
-            duration = after - before
-            probe_duration.labels(name=probe["name"], args=probe["args"]).set(duration)
-            logger.info(f"Probe {probe['name']} took {duration} seconds to run")
+            t = threading.Thread(target=iteration, args=(probe,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        end = time.perf_counter()
 
         # Wait for next iteration
-        interval = config.getint("config", "interval") - (after - start)
+        interval = config.getint("config", "interval") - (end - start)
         logger.debug(f"Waiting for {interval} seconds for next iteration")
         time.sleep(interval)
