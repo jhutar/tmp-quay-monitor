@@ -23,7 +23,11 @@ _logging_lvl_map = {
 
 # Create logger
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=_logging_lvl_map[config["config"]["logging_level"]])
+logging.basicConfig(
+    format='%(asctime)s %(name)s %(threadName)s %(levelname)s %(message)s',
+    level=_logging_lvl_map[config.get("config", "logging_level")],
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
 logger.debug(f"Loaded config: {dict(config['config'])}")
 
 # Create a Prometheus gauge metrics
@@ -115,7 +119,7 @@ def iteration(probe):
         with stopit2.ThreadingTimeout(probe["timeout"]) as timeout_mgr:
             probe["func"](probe["args"])
         if not timeout_mgr:
-            raise Exception("Probe {probe['name']} did not finished before timeout {probe['timeout']}")
+            raise Exception(f"Probe {probe['name']} did not finished before timeout {probe['timeout']}")
     except Exception as e:
         probe_success.labels(name=probe["name"], args=probe["args"]).set(1)
         logger.exception(f"Probe {probe['name']} failed with {e}")
@@ -146,7 +150,7 @@ if __name__ == "__main__":
             })
         else:
             logger.warning(f"Failed to load probe '{probe_name}'")
-    logger.info(f"Loaded {len(probes_list)} probes: {probes_list}")
+    logger.info(f"Loaded {len(probes_list)} probes: {', '.join([p['name'] for p in probes_list])}")
 
     logger.info("Starting probing loop")
     while True:
