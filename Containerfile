@@ -9,7 +9,7 @@ WORKDIR /app
 # Install additional package according to guide here:
 # https://catalog.redhat.com/software/containers/rhel10/python-312-minimal/677d3146199814f7fac1401d?container-tabs=overview
 USER 0
-RUN INSTALL_PKGS="skopeo" && \
+RUN INSTALL_PKGS="git-core skopeo" && \
     mkdir -p /var/cache/yum/metadata && \
     microdnf -y --setopt=tsflags=nodocs --setopt=install_weak_deps=0 install $INSTALL_PKGS && \
     microdnf -y clean all --enablerepo='*'

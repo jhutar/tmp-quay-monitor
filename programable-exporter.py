@@ -29,66 +29,105 @@ logger.debug(f"Loaded config: {dict(config['config'])}")
 probe_duration = prometheus_client.Gauge(
     "progexp_probe_duration",
     "How long the last execution of the Programable exporter probe took in seconds",
-    ["image"],
+    ["name", "args"],
 )
 probe_success = prometheus_client.Gauge(
     "progexp_probe_success",
     "Was the last Programable exporter probe execution successful? 0 for pass, 1 otherwise",
-    ["image"],
+    ["name", "args"],
 )
 probe_last_start = prometheus_client.Gauge(
     "progexp_probe_last_start",
     "When was the Programable exporter probe last started time as unix timestamp",
-    ["image"],
+    ["name", "args"],
 )
 
+class Probes():
+    def probe_quay(self, image):
+        """
+        Test if we can pull from quay.io
+        """
+        logger = logging.getLogger("probe_quay")
 
-def measure(image):
-    """
-    Perform a measured action
-    """
-    logger = logging.getLogger("probe")
+        logger.debug("Cleanup")
+        try:
+            shutil.rmtree("/tmp/probe_quay")
+        except FileNotFoundError:
+            pass
 
-    logger.debug("Cleanup")
-    try:
-        shutil.rmtree("/tmp/storage")
-    except FileNotFoundError:
-        pass
+        logger.debug(f"Pulling {image}")
+        completed = subprocess.run(
+            ["skopeo", "copy", "docker://" + image, "dir:///tmp/probe_quay"],
+            capture_output=True,
+            check=True,
+        )
+        logger.debug(f"Pulled: {completed}")
 
-    logger.debug(f"Pulling {image}")
-    completed = subprocess.run(
-        ["skopeo", "copy", "docker://" + image, "dir:///tmp/storage"],
-        capture_output=True,
-        check=True,
-    )
-    logger.debug(f"Pulled: {completed}")
+
+    def probe_github(self, repo):
+        """
+        Test if we canclone from github.com
+        """
+        logger = logging.getLogger("probe_github")
+
+        logger.debug("Cleanup")
+        try:
+            shutil.rmtree("/tmp/probe_github")
+        except FileNotFoundError:
+            pass
+
+        logger.debug(f"Cloning {repo}")
+        completed = subprocess.run(
+            ["git", "clone", repo, "/tmp/probe_github"],
+            capture_output=True,
+            check=True,
+        )
+        logger.debug(f"Cloned: {completed}")
 
 
 if __name__ == "__main__":
     logger.info("Starting metrics endpoint server")
     prometheus_client.start_http_server(int(config["config"]["port"]))
 
+    probes = Probes()
+    probes_list = []
+    for probe_name in config.sections():
+        if probe_name == "config":
+            continue
+        if hasattr(probes, probe_name) and callable(getattr(probes, probe_name)):
+            probes_list.append({
+                "name": probe_name,
+                "func": getattr(probes, probe_name),
+                "args": config.get(probe_name, "args"),
+                "timeout": config.getint(probe_name, "timeout"),
+            })
+        else:
+            logger.warning(f"Failed to load probe '{probe_name}'")
+    logger.info(f"Loaded {len(probes_list)} probes: {probes_list}")
+
     logger.info("Starting probing loop")
     while True:
-        probe_last_start.labels(image=config["config"]["image"]).set_to_current_time()
-        before = time.perf_counter()
-        try:
-            with stopit2.ThreadingTimeout(int(config["config"]["probe_timeout"])) as timeout_mgr:
-                measure(config["config"]["image"])
-            if not timeout_mgr:
-                raise Exception("Probe did not finished before timeout")
-        except Exception as e:
-            probe_success.labels(image=config["config"]["image"]).set(1)
-            logger.exception(f"Probe failed with {e}")
-        else:
-            probe_success.labels(image=config["config"]["image"]).set(0)
-            logger.info(f"Probe passed")
-        after = time.perf_counter()
-        duration = after - before
-        probe_duration.labels(image=config["config"]["image"]).set(duration)
-        logger.info(f"Probe took {duration} seconds to run")
+        start = time.perf_counter()
+        for probe in probes_list:
+            probe_last_start.labels(name=probe["name"], args=probe["args"]).set_to_current_time()
+            before = time.perf_counter()
+            try:
+                with stopit2.ThreadingTimeout(probe["timeout"]) as timeout_mgr:
+                    probe["func"](probe["args"])
+                if not timeout_mgr:
+                    raise Exception("Probe {probe['name']} did not finished before timeout {probe['timeout']}")
+            except Exception as e:
+                probe_success.labels(name=probe["name"], args=probe["args"]).set(1)
+                logger.exception(f"Probe {probe['name']} failed with {e}")
+            else:
+                probe_success.labels(name=probe["name"], args=probe["args"]).set(0)
+                logger.info(f"Probe {probe['name']} passed")
+            after = time.perf_counter()
+            duration = after - before
+            probe_duration.labels(name=probe["name"], args=probe["args"]).set(duration)
+            logger.info(f"Probe {probe['name']} took {duration} seconds to run")
 
         # Wait for next iteration
-        interval = int(config["config"]["interval"]) - (after - before)
-        logger.debug(f"Waiting for {interval} seconds for next test")
+        interval = config.getint("config", "interval") - (after - start)
+        logger.debug(f"Waiting for {interval} seconds for next iteration")
         time.sleep(interval)
