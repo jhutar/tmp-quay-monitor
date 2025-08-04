@@ -9,7 +9,6 @@ import time
 import subprocess
 import shutil
 
-# --- CONFIG, LOGGING, and PROMETHEUS METRICS (Unchanged) ---
 # Load config
 config = configparser.ConfigParser()
 config.read(os.environ.get("CONFIG_FILE", "programable-exporter.ini"))
@@ -24,9 +23,9 @@ _logging_lvl_map = {
 # Create logger
 logger = logging.getLogger(__name__)
 logging.basicConfig(
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    format='%(asctime)s %(name)s %(levelname)s %(message)s',
     level=_logging_lvl_map[config.get("config", "logging_level")],
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger.debug(f"Loaded config: {dict(config['config'])}")
 
@@ -47,15 +46,13 @@ probe_last_start = prometheus_client.Gauge(
     ["name", "args"],
 )
 
-# --- ASYNC PROBE IMPLEMENTATIONS ---
 
-
-class Probes:
+class Probes():
     async def probe_slow(self, _):
         """Test probe to ensure we handle timeouting probes."""
         logger = logging.getLogger("probe_slow")
         logger.debug("Starting slow probe")
-        await asyncio.sleep(20)  # Use non-blocking sleep
+        await asyncio.sleep(20) # Use non-blocking sleep
         logger.debug("Timeout did not happen - this should not happen!")
 
     async def probe_exception(self, _):
@@ -65,10 +62,19 @@ class Probes:
         raise Exception("Just to test we handle exceptions")
         logger.debug("Exception did not happen - this should not happen!")
 
+    async def probe_failure(self, _):
+        """Test probe to ensure we handle cmd exiting with non-0."""
+        logger = logging.getLogger("probe_failure")
+        logger.debug("Starting buggy command probe")
+        stdout, stderr = await self._run_command(["false"])
+        logger.debug("Failure did not happen - this should not happen!")
+
     async def _run_command(self, cmd_args: list):
         """Helper to run external commands asynchronously."""
         proc = await asyncio.create_subprocess_exec(
-            *cmd_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *cmd_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
 
@@ -77,7 +83,7 @@ class Probes:
             raise subprocess.CalledProcessError(
                 proc.returncode, cmd_args, output=stdout, stderr=stderr
             )
-        return stdout.decode()
+        return stdout.decode(), stderr.decode()
 
     async def probe_quay(self, image):
         """Test if we can pull from quay.io asynchronously."""
@@ -86,10 +92,10 @@ class Probes:
         shutil.rmtree("/tmp/probe_quay", ignore_errors=True)
 
         logger.debug(f"Pulling {image}")
-        completed = await self._run_command(
+        stdout, stderr = await self._run_command(
             ["skopeo", "copy", f"docker://{image}", "dir:///tmp/probe_quay"]
         )
-        logger.debug(f"Pulled: {completed}")
+        logger.debug(f"Pulled: stdout: {stdout}, stderr: {stderr}")
 
     async def probe_github(self, repo):
         """Test if we can clone from github.com asynchronously."""
@@ -98,38 +104,42 @@ class Probes:
         shutil.rmtree("/tmp/probe_github", ignore_errors=True)
 
         logger.debug(f"Cloning {repo}")
-        completed = await self._run_command(["git", "clone", repo, "/tmp/probe_github"])
+        completed = await self._run_command(
+            ["git", "clone", repo, "/tmp/probe_github"]
+        )
         logger.debug(f"Cloned: {completed}")
-
-
-# --- ASYNC ORCHESTRATION LOGIC ---
 
 
 async def run_single_probe(probe):
     """Manages the execution and metrics for a single async probe."""
     logger = logging.getLogger(f"runner.{probe['name']}")
-    probe_labels = {"name": probe["name"], "args": probe["args"]}
+    probe_labels = {
+        "name": probe["name"],
+        "args": probe["args"],
+    }
 
     probe_last_start.labels(**probe_labels).set_to_current_time()
     before = time.perf_counter()
 
     try:
-        # Use asyncio.wait_for for reliable timeouts
-        await asyncio.wait_for(probe["func"](probe["args"]), timeout=probe["timeout"])
+        await asyncio.wait_for(
+            probe["func"](probe["args"]),
+            timeout=probe["timeout"],
+        )
     except asyncio.TimeoutError:
-        probe_success.labels(**probe_labels).set(0)  # 0 for fail
+        probe_success.labels(**probe_labels).set(1)
         logger.error(f"Probe timed out after {probe['timeout']} seconds")
-    except Exception:
-        probe_success.labels(**probe_labels).set(0)  # 0 for fail
-        logger.exception("Probe failed with an exception")
+    except Exception as e:
+        probe_success.labels(**probe_labels).set(1)
+        logger.exception(f"Probe failed with an exception: {e}")
     else:
-        probe_success.labels(**probe_labels).set(1)  # 1 for pass
+        probe_success.labels(**probe_labels).set(0)
         logger.info("Probe passed")
     finally:
         after = time.perf_counter()
         duration = after - before
         probe_duration.labels(**probe_labels).set(duration)
-        logger.info(f"Probe took {duration:.2f} seconds to run")
+        logger.info(f"Probe took {duration:2f} seconds to run")
 
 
 async def main():
@@ -139,32 +149,25 @@ async def main():
     for probe_name in config.sections():
         if probe_name == "config":
             continue
-        # Important: check for 'probe_' prefix to ensure it's a real probe
-        if probe_name.startswith("probe_") and hasattr(probes, probe_name):
-            probes_list.append(
-                {
-                    "name": probe_name,
-                    "func": getattr(probes, probe_name),
-                    "args": config.get(probe_name, "args", fallback=""),
-                    "timeout": config.getint(probe_name, "timeout"),
-                }
-            )
+        if hasattr(probes, probe_name) and callable(getattr(probes, probe_name)):
+            probes_list.append({
+                "name": probe_name,
+                "func": getattr(probes, probe_name),
+                "args": config.get(probe_name, "args", fallback=""),
+                "timeout": config.getint(probe_name, "timeout"),
+            })
         else:
-            logger.warning(
-                f"Failed to load or find a valid probe method for '{probe_name}'"
-            )
+            logger.warning(f"Failed to load or find a valid probe method for '{probe_name}'")
 
-    logger.info(
-        f"Loaded {len(probes_list)} probes: {', '.join([p['name'] for p in probes_list])}"
-    )
+    logger.info(f"Loaded {len(probes_list)} probes: {', '.join([p['name'] for p in probes_list])}")
 
     logger.info("Starting probing loop")
     while True:
         start = time.perf_counter()
 
-        # Create a list of tasks to run concurrently
+        # Run all probes concurrently
         tasks = [run_single_probe(p) for p in probes_list]
-        await asyncio.gather(*tasks)  # Run all probes concurrently
+        await asyncio.gather(*tasks)
 
         end = time.perf_counter()
 
@@ -177,9 +180,8 @@ async def main():
 
 if __name__ == "__main__":
     logger.info("Starting metrics endpoint server")
-    prometheus_client.start_http_server(int(config["config"]["port"]))
+    prometheus_client.start_http_server(config.getint("config", "port"))
 
-    # Run the main asynchronous event loop
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
